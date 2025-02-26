@@ -1,0 +1,14 @@
+openai
+autogen-agentchat
+autogen-ext[azure]
+autogen-ext[openai]
+ipykernel
+python-dotenv
+pydantic
+websockets 
+asyncio
+nest_asyncio
+numpy
+IPython
+pyaudio
+sounddevice
