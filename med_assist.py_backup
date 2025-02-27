@@ -1,0 +1,145 @@
+import os
+import asyncio
+from dotenv import load_dotenv
+
+# Autogen imports
+from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
+from autogen_agentchat.messages import TextMessage
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
+from autogen_core import CancellationToken
+
+###############################################################################
+# Step 1) Load environment variables for Azure OpenAI
+###############################################################################
+load_dotenv()
+
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VER  = "2024-06-01"  # or whichever version you need
+
+###############################################################################
+# 2) Create a "GatekeeperTeam" orchestrator
+###############################################################################
+class GatekeeperTeam:
+    """
+    A simple orchestrator that ties together:
+      - UserProxyAgent
+      - GatekeeperAgent (classifies and routes to the specialist)
+      - SpecialistAgent (answers main request).
+    """
+
+    def __init__(self, user_proxy_agent: UserProxyAgent,
+                 gatekeeper_agent: AssistantAgent,
+                 specialist_agent: AssistantAgent):
+        self.user_proxy_agent = user_proxy_agent
+        self.gatekeeper_agent = gatekeeper_agent
+        self.specialist_agent = specialist_agent
+
+    async def run(self, text_input: str) -> str:
+        """
+        1) The UserProxyAgent receives user text (simulated).
+        2) The GatekeeperAgent classifies, returns label.
+        3) If 'emergency', short-circuit. Otherwise pass to SpecialistAgent.
+        4) Return final text response.
+        """
+
+        # Not calling user_proxy_agent.on_messages() for simplicity;
+        # we just simulate the user input is already available.
+        print(f"[UserProxyAgent sees user text: {text_input}]")
+
+        # Phase B: Gatekeeper classifies
+        gatekeeper_response = await self.gatekeeper_agent.on_messages(
+            [TextMessage(content=text_input, source="user")],
+            cancellation_token=CancellationToken()
+        )
+        classification = gatekeeper_response.chat_message.content.strip().lower()
+        print(f"[GatekeeperAgent classification: '{classification}']")
+
+        # Phase C: If "emergency", short-circuit
+        if "emergency" in classification:
+            return (
+                "It appears you have an emergency. "
+                "Please dial 911 or seek immediate care."
+            )
+        else:
+            # Otherwise pass user text to SpecialistAgent
+            specialist_resp = await self.specialist_agent.on_messages(
+                [TextMessage(content=text_input, source="user")],
+                cancellation_token=CancellationToken()
+            )
+            return specialist_resp.chat_message.content
+
+
+async def main():
+    # -------------------------------------------------------------------
+    # 1) Create AzureOpenAI model clients
+    # -------------------------------------------------------------------
+    # Gatekeeper (o1-mini) for classification
+    gatekeeper_client = AzureOpenAIChatCompletionClient(
+        model="gpt-4o",                 # "o1-mini" deployment
+        api_version=AZURE_OPENAI_API_VER,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY
+    )
+
+    # Specialist (gpt-4o) for actual request
+    specialist_client = AzureOpenAIChatCompletionClient(
+        model="gpt-4o",                 # "gpt-4o" deployment
+        api_version=AZURE_OPENAI_API_VER,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY
+    )
+
+    # -------------------------------------------------------------------
+    # 2) Define Gatekeeper & Specialist Agents
+    # -------------------------------------------------------------------
+    gatekeeper_agent = AssistantAgent(
+        name="GatekeeperAgent",
+        model_client=gatekeeper_client,
+        system_message=(
+            "You are the GatekeeperAgent using a small model (o1-mini). "
+            "Classify the user request as one of: [new_symptoms, existing_condition, "
+            "other, emergency]. Respond ONLY with that single word."
+        ),
+    )
+
+    specialist_agent = AssistantAgent(
+        name="SpecialistAgent",
+        model_client=specialist_client,
+        system_message=(
+            "You are the main Specialist Agent using gpt-4o. "
+            "You handle the user's medical-related questions thoroughly and calmly."
+        ),
+    )
+
+    # -------------------------------------------------------------------
+    # 3) Minimal user proxy
+    # -------------------------------------------------------------------
+    user_proxy_agent = UserProxyAgent(name="UserProxyAgent", input_func=None)
+
+    # -------------------------------------------------------------------
+    # 4) Build GatekeeperTeam orchestrator
+    # -------------------------------------------------------------------
+    team = GatekeeperTeam(
+        user_proxy_agent=user_proxy_agent,
+        gatekeeper_agent=gatekeeper_agent,
+        specialist_agent=specialist_agent
+    )
+
+    # -------------------------------------------------------------------
+    # 5) Example usage
+    # -------------------------------------------------------------------
+    test_user_inputs = [
+        "Hi, I have chest pain and trouble breathing. Should I come in?",
+        "I have mild knee pain from an old injury. Any advice?",
+        "I think I'm having an emergency, I'm fainting."
+    ]
+
+    for user_text in test_user_inputs:
+        print(f"\nUser says: {user_text}")
+        final_answer = await team.run(user_text)
+        print(f"System final response: {final_answer}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
