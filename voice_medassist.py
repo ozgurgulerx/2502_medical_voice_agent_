@@ -6,7 +6,6 @@ import numpy as np
 import sounddevice as sd
 import websockets
 from dotenv import load_dotenv
-import datetime
 
 class AudioProcessor:
     def __init__(self, sample_rate=24000):
@@ -21,10 +20,9 @@ class AudioProcessor:
         self.speech_detected = False
 
     def process_audio(self, indata):
-        # Don't capture user audio when assistant is speaking
+        # If TTS playing, skip capturing user audio
         if self.is_speaking:
             return
-
         audio_level = np.abs(indata).mean() / 32768.0
         if audio_level > self.vad_threshold:
             self.speech_detected = True
@@ -44,12 +42,11 @@ class AudioProcessor:
         )
 
     def reset(self):
-        # Return the audio so we can send it to the server
+        audio_data = bytes(self.buffer)
+        self.buffer.clear()
         self.speech_frames = 0
         self.silence_frames = 0
         self.speech_detected = False
-        audio_data = bytes(self.buffer)
-        self.buffer.clear()
         return audio_data
 
 class ConversationSystem:
@@ -59,7 +56,7 @@ class ConversationSystem:
         if not self.api_key:
             raise ValueError("AZURE_OPENAI_API_KEY not found")
 
-        # AOAI real-time endpoint
+        # Websocket endpoint
         self.url = (
             "wss://aoai-ep-swedencentral02.openai.azure.com/openai/realtime?"
             f"api-version=2024-10-01-preview&deployment=gpt-4o-realtime-preview&"
@@ -68,40 +65,30 @@ class ConversationSystem:
         self.audio_processor = AudioProcessor()
         self.streams = {'input': None, 'output': None}
 
-    def log(self, msg):
-        t = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{t}] {msg}")
-
     def audio_callback(self, indata, frames, time, status):
         if status:
-            self.log(f"Audio stream status: {status}")
+            print(f"Audio stream status: {status}")
         self.audio_processor.process_audio(indata)
 
     async def setup_audio(self):
-        # Create output stream for TTS
         self.streams['output'] = sd.OutputStream(
             samplerate=24000,
             channels=1,
             dtype=np.int16
         )
-        # Create input stream for user voice
         self.streams['input'] = sd.InputStream(
             samplerate=24000,
             channels=1,
             dtype=np.int16,
-            blocksize=4800,
             callback=self.audio_callback,
+            blocksize=4800
         )
-        # Start both streams
         self.streams['output'].start()
         self.streams['input'].start()
 
     async def setup_websocket_session(self, websocket):
         """
-        We explicitly say:
-          - you are a medical call agent
-          - produce both audio and text
-          - do not mention Dr Smith or booking appointments unless specifically asked
+        Start a new session. We'll also send an initial user message once we see 'session.created'.
         """
         session_config = {
             "type": "session.update",
@@ -117,7 +104,7 @@ class ConversationSystem:
                     " - New symptoms (caller seeking care for a newly arising complaint).\n"
                     " - Existing condition (caller has an ongoing issue or known diagnosis).\n"
                     " - Other medical reasons (e.g., test results, referrals, or administrative inquiries).\n"
-                    " - Medical emergency (urgent or serious symptoms—this leads to a roadblock and immediate escalation).\n"
+                    " - Medical emergency (urgent or serious symptoms—this leads to immediate escalation).\n"
                     "Once you identify the intent, route the conversation or proceed with the correct flow. "
                     "Remain professional, calm, and ensure the caller feels supported."
                 ),
@@ -134,49 +121,44 @@ class ConversationSystem:
         }
         await websocket.send(json.dumps(session_config))
 
+        # Wait for session creation
         while True:
             resp_str = await websocket.recv()
             data = json.loads(resp_str)
-
             if data["type"] == "session.created":
-                self.log("Session created. Sending initial greeting.")
-                # We'll treat it as if user said hi.
+                print("Session created! We'll send an initial user greeting now.")
+                # Let's greet as if the user said "Hello..."
                 await self.send_message(websocket, "Hello, I'm calling for medical help. Are you the medical call agent?")
-                # We'll handle the immediate TTS response from that.
+                # We'll handle the TTS response
                 await self.handle_response(websocket)
                 break
             elif data["type"] == "error":
-                raise RuntimeError(f"Session error: {data}")
+                raise Exception(f"Session error: {data}")
 
-    async def send_message(self, ws, user_text):
-        self.log(f"[User] {user_text}")
+    async def send_message(self, ws, text):
         payload = {
             "type": "conversation.item.create",
             "item": {
                 "type": "message",
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_text}
-                ]
+                "content": [{"type": "input_text", "text": text}]
             }
         }
         await ws.send(json.dumps(payload))
-
-        # Then ask the server to generate audio+text
+        # Then request TTS
         await ws.send(json.dumps({
             "type": "response.create",
             "response": {"modalities": ["audio", "text"]}
         }))
 
     async def send_audio(self, ws, audio_data):
-        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-        # Append user audio
+        # Send user audio for STT
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
         await ws.send(json.dumps({
             "type": "input_audio_buffer.append",
-            "audio": audio_b64
+            "audio": audio_base64
         }))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        # Then ask for TTS + text
         await ws.send(json.dumps({
             "type": "response.create",
             "response": {"modalities": ["audio", "text"]}
@@ -184,85 +166,64 @@ class ConversationSystem:
 
     async def handle_response(self, ws):
         """
-        Listen for:
-         - response.audio.delta => TTS chunks
-         - response.text.delta => partial text from assistant
-         - response.text.done => final text from assistant
-         - conversation.item.created => new item from user or assistant
+        Process server messages: TTS data, user messages, etc.
+        We break once "response.done" => done with TTS chunk.
         """
+        # Mute user capturing while TTS plays
         self.audio_processor.is_speaking = True
         try:
             while True:
                 resp_str = await ws.recv()
                 data = json.loads(resp_str)
+                msg_type = data.get("type", "")
 
-                # TTS audio
-                if data.get("type") == "response.audio.delta":
+                if msg_type == "response.audio.delta":
                     audio_b64 = data.get("delta", "").strip()
                     if audio_b64:
+                        # Fix padding
                         pad = -len(audio_b64) % 4
                         if pad:
                             audio_b64 += "=" * pad
                         try:
-                            audio_array = np.frombuffer(
-                                base64.b64decode(audio_b64), dtype=np.int16
-                            )
+                            audio_decoded = base64.b64decode(audio_b64)
+                            audio_array = np.frombuffer(audio_decoded, dtype=np.int16)
                             self.streams['output'].write(audio_array)
                         except Exception as e:
-                            self.log(f"Audio decode error: {e}")
+                            print(f"Audio decode error: {e}")
 
-                # Assistant partial text
-                elif data.get("type") == "response.text.delta":
-                    partial_text = data.get("delta", "")
-                    if partial_text:
-                        self.log(f"[MedAssist partial] {partial_text}")
-
-                # Assistant final text
-                elif data.get("type") == "response.text.done":
-                    final_text = data.get("text", "")
-                    if final_text:
-                        self.log(f"[MedAssist final] {final_text}")
-
-                # If new conversation item created (often user or system message)
-                elif data.get("type") == "conversation.item.created":
+                elif msg_type == "conversation.item.created":
+                    # This can be user speech STT or assistant text
                     item = data.get("item", {})
                     role = item.get("role", "")
                     content_list = item.get("content", [])
-                    # Possibly show transcription if user is recognized
-                    if role == "user":
-                        # This might be the user transcription text if server's STT is on
-                        text_content = "".join(c.get("text", "") for c in content_list)
-                        if text_content:
-                            self.log(f"[User STT] {text_content}")
-                    elif role == "assistant":
-                        # Or any new assistant item
-                        text_content = "".join(c.get("text", "") for c in content_list)
-                        if text_content:
-                            self.log(f"[MedAssist] {text_content}")
+                    text_content = "".join(c.get("text", "") for c in content_list)
 
-                elif data.get("type") == "response.done":
-                    # This signals the end of this response chunk
+                    # If user says something, we see it transcribed here
+                    if role == "user":
+                        print(f"[User STT] {text_content}")
+
+                elif msg_type == "response.done":
+                    # Done with TTS chunk
                     break
 
-                # else, you might see other message types
         finally:
             self.audio_processor.is_speaking = False
 
     async def run(self):
         await self.setup_audio()
         async with websockets.connect(self.url) as ws:
-            # 1) Setup session => TTS and text
+            # Setup session => send initial user greeting
             await self.setup_websocket_session(ws)
-            self.log("Session setup complete. Entering main loop...")
+            print("Session setup complete. Begin main loop...")
 
-            # 2) Loop, check if user done speaking, then send audio, handle response
             while True:
+                # If user has spoken enough => send audio to server
                 if self.audio_processor.should_process():
-                    audio_data = self.audio_processor.reset()
-                    # show we got user audio
-                    self.log("[User] (audio captured)")
-                    await self.send_audio(ws, audio_data)
+                    captured = self.audio_processor.reset()
+                    await self.send_audio(ws, captured)
+                    # Now wait for TTS
                     await self.handle_response(ws)
+
                 await asyncio.sleep(0.05)
 
 if __name__ == "__main__":
